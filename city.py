@@ -3,9 +3,12 @@ import random
 import os
 import math
 import numpy as np
-from shapely.geometry import Point, LineString, Polygon, MultiPoint
+from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiPolygon
 from shapely.ops import unary_union
 import colorsys
+import subprocess
+
+import building
 from params import *
 from tqdm import tqdm
 import trimesh
@@ -61,7 +64,7 @@ def perform_union(paths):
     nodes, counts = np.unique(nodes, axis=0, return_counts=True)
     return nodes, counts
 
-def render_building(x, y, max_radius, height_offset, building_geoms):
+def render_building(x, y, max_radius, height_offset, building_geoms, window_texture):
     dist = np.sqrt(x ** 2 + y ** 2)
     angle = math.atan2(x,y)
     xn, yn = x / dist, y / dist
@@ -106,12 +109,20 @@ def render_building(x, y, max_radius, height_offset, building_geoms):
 
     coords = [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
     edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+
     poly = trimesh.path.polygons.edges_to_polygons(edges, np.array(coords))[0]
     mesh = trimesh.creation.extrude_polygon(poly, (1.0 - dist) * building_height_rate + random.random() * 0.02 - 0.01)
     # translate the mesh to lay on the terrain
     base_height = terrain_get_base_height(max_radius, height_offset) + terrain_get_extrude_height(max_radius, dist)
     mesh.vertices[:, 2] += base_height
-    mesh.visual.mesh.visual.face_colors = [255, 0, 64, 200]
+
+    uvs = [(0, 0), (0, 1), (1, 0), (1, 1), (1, 0), (1, 1), (0, 0), (0, 1)]
+    r,g,b = random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
+    material = trimesh.visual.material.PBRMaterial(name='building', baseColorFactor=[r,b,g], metallicFactor=0.6,
+                                                   roughnessFactor=0.1, emissiveTexture = window_texture,
+                                                   emissiveFactor = [1.0, 1.0, 1.0])
+
+    mesh.visual = trimesh.visual.TextureVisuals(material=material, uv=uvs)
     building_geoms.append(mesh)
 
 def terrain_get_base_height(island_max_radius, island_height_offset):
@@ -152,8 +163,12 @@ for node in nodes:
     circle = Polygon( coords ).buffer(0)
     circles.append(circle)
 
+print ('generating window texture')
+window_texture = building.generate_window_texture()
+
 print ('performing circle union')
 circle_union = unary_union(circles)
+circle_union = circle_union.intersection( Point(0,0).buffer(inner_circle_max))
 print ('done')
 
 # let's determine the number of islands, and for each island several properties
@@ -269,15 +284,60 @@ for island in tqdm(islands):
 
         for i in point_list:
             x,y = i.coords[0]
-            render_building(x,y, max_radius, height_offset, building_geoms)
+            render_building(x,y, max_radius, height_offset, building_geoms, window_texture)
     e+=1
 
-for island in islands:
+# generate the island bases
+island_base_meshes = []
+e = 0
+print ('generating island bases')
+for island in tqdm(islands):
     x, y = island.centroid.coords[0]
+    area = island.area
     ctx.arc(x,y, 0.007, 0.0, math.pi*2.0)
     ctx.set_source_rgb(1.0, 1.0, 1.0)
     ctx.set_line_width(0.003)
     ctx.stroke()
+
+    base_height = terrain_get_base_height(island_max_radius[e], island_height_offsets[e])
+    base_coords = [(lx,ly,base_height) for lx,ly in island.exterior.coords]
+    center_index = len(base_coords)
+    depth = area
+    depth = max(area, 0.02)
+    depth = min(depth, 0.05)
+    bottom_height = base_height - depth
+
+    r1 = 0.5 + area ** .35
+    r1 = min(0.95, r1)
+
+    bottom_coords = []
+    ncoords = len(island.exterior.coords)
+    offset = random.random()
+    for ee,(lx,ly) in enumerate(island.exterior.coords):
+        qr1 = r1 + random.random() * .02
+        qr2 = 1 - qr1
+        tx = lx * qr1 + x * qr2
+        ty = ly * qr1 + y * qr2
+        tz = bottom_height - np.sin(offset + 2.0 * np.pi * ee / ncoords) * depth / 4.0
+        bottom_coords.append((tx, ty, tz))
+
+    num_coords = len(base_coords)
+    base_coords.extend(bottom_coords)
+
+    faces1 = [ (i, i+1, i+num_coords) for i in range(num_coords-1)]
+    faces1.append( (num_coords-1, 0, num_coords))
+    faces2 = [ (i+1, i+num_coords+1, i+num_coords) for i in range(num_coords-1)]
+    faces2.append( (0, num_coords, num_coords*2-1))
+    faces1.extend(faces2)
+
+    island_base_mesh = trimesh.Trimesh(vertices=base_coords,faces=faces1)
+
+    # clip the bottom of the mesh using a translated bounding box
+    island_base_mesh.visual.mesh.visual.face_colors = [212, 212, 212, 255]
+    island_base_meshes.append(island_base_mesh)
+    e+=1
+
+
 
 for node in nodes:
     x, y = node
@@ -294,19 +354,34 @@ for node in nodes:
 surface.write_to_png(out_image)
 os.system(out_image)
 terrain_concat = trimesh.util.concatenate(meshes)
-building_concat = trimesh.util.concatenate(building_geoms)
+island_base_concat = trimesh.util.concatenate(island_base_meshes)
 
-#scene = trimesh.scene.Scene(geometry=[terrain_concat, building_concat])
-#trimesh.exchange.export.export_scene(scene, 'out/out.glb', file_type='glb')
-pyrender_terrain = pyrender.Mesh.from_trimesh(terrain_concat, smooth=False)
-pyrender_building = pyrender.Mesh.from_trimesh(building_concat, smooth=False)
+building_concats = []
+for i in range(0, len(building_geoms), 400):
+    building_concats.append( trimesh.util.concatenate(building_geoms[i:i+400] ))
 
-scene = pyrender.Scene()
-scene.add(pyrender_terrain)
-scene.add(pyrender_building)
-pyrender.Viewer(scene, viewport_size=(1000, 1000),
-                use_raymond_lighting=True,
-                shadows=True,
-                window_title='City Art')
+geometry = [terrain_concat, island_base_concat]
+geometry.append(building_geoms[0:10])
+
+scene = trimesh.scene.Scene(geometry=geometry)
+trimesh.exchange.export.export_scene(scene, 'out/out.glb', file_type='glb')
+
+
+#print ('spawning keyshot')
+#subprocess.Popen([r"c:\program files\KeyShot10\bin\keyshot.exe","-script","keyshot.py"])
+#print (' done!')
+
+#pyrender_terrain = pyrender.Mesh.from_trimesh(terrain_concat, smooth=False)
+#pyrender_building = pyrender.Mesh.from_trimesh(building_concats, smooth=False)6
+#pyrender_island_bases = pyrender.Mesh.from_trimesh(island_base_concat, smooth=False)
+
+#scene = pyrender.Scene()
+#scene.add(pyrender_terrain)
+#scene.add(pyrender_building)
+#scene.add(pyrender_island_bases)
+#pyrender.Viewer(scene, viewport_size=(1000, 1000),
+#                use_raymond_lighting=True,
+#                shadows=True,
+#                window_title='City Art')
 
 

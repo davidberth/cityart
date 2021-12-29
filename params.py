@@ -5,7 +5,7 @@ size = (3000, 3000)
 thickness_branch_reduction = 0.0001
 branch_angle_increment = 45
 
-influence_radius_multiplier = 0.005
+influence_radius_multiplier = 0.004
 influence_radius_min = 0.018
 influence_radius_max = 0.12
 influence_circle_resolution = 8
