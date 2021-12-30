@@ -3,10 +3,11 @@ import random
 import os
 import math
 import numpy as np
-from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiPolygon
-from shapely.ops import unary_union
+from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiPolygon, MultiLineString
+from shapely.ops import unary_union, split
 import colorsys
-import subprocess
+from sklearn.neighbors import KNeighborsClassifier
+#import subprocess
 
 import building
 from params import *
@@ -64,7 +65,11 @@ def perform_union(paths):
     nodes, counts = np.unique(nodes, axis=0, return_counts=True)
     return nodes, counts
 
-def render_building(x, y, max_radius, height_offset, building_geoms, window_texture):
+def create_quad(coords):
+    faces = [(0,1,3), (1,2,3)]
+    return trimesh.Trimesh(vertices = coords, faces = faces)
+
+def render_building(x, y, max_radius, height_offset, building_walls, building_roofs):
     dist = np.sqrt(x ** 2 + y ** 2)
     angle = math.atan2(x,y)
     xn, yn = x / dist, y / dist
@@ -107,23 +112,22 @@ def render_building(x, y, max_radius, height_offset, building_geoms, window_text
     ctx.line_to(x1, y1)
     ctx.stroke()
 
-    coords = [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
-    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
-
-    poly = trimesh.path.polygons.edges_to_polygons(edges, np.array(coords))[0]
-    mesh = trimesh.creation.extrude_polygon(poly, (1.0 - dist) * building_height_rate + random.random() * 0.02 - 0.01)
-    # translate the mesh to lay on the terrain
     base_height = terrain_get_base_height(max_radius, height_offset) + terrain_get_extrude_height(max_radius, dist)
-    mesh.vertices[:, 2] += base_height
+    building_height = (1.0 - dist) * building_height_rate + random.random() * 0.02 - 0.01
+    top_height = base_height + building_height
 
-    uvs = [(0, 0), (0, 1), (1, 0), (1, 1), (1, 0), (1, 1), (0, 0), (0, 1)]
-    r,g,b = random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
-    material = trimesh.visual.material.PBRMaterial(name='building', baseColorFactor=[r,b,g], metallicFactor=0.6,
-                                                   roughnessFactor=0.1, emissiveTexture = window_texture,
-                                                   emissiveFactor = [1.0, 1.0, 1.0])
 
-    mesh.visual = trimesh.visual.TextureVisuals(material=material, uv=uvs)
-    building_geoms.append(mesh)
+    building_walls.append(
+        create_quad([(x1, y1, base_height), (x2, y2, base_height), (x2, y2, top_height), (x1, y1, top_height)]))
+    building_walls.append(
+        create_quad([(x2, y2, base_height), (x3, y3, base_height), (x3, y3, top_height), (x2, y2, top_height)]))
+    building_walls.append(
+        create_quad([(x3, y3, base_height), (x4, y4, base_height), (x4, y4, top_height), (x3, y3, top_height)]))
+    building_walls.append(
+        create_quad([(x4, y4, base_height), (x1, y1, base_height), (x1, y1, top_height), (x4, y4, top_height)]))
+
+    building_roofs.append(
+        create_quad([(x1, y1, top_height), (x2, y2, top_height), (x3, y3, top_height), (x4, y4, top_height)]))
 
 def terrain_get_base_height(island_max_radius, island_height_offset):
     return 0.8 * (1.0 - island_max_radius) * terrain_height_rate + island_height_offset
@@ -132,9 +136,54 @@ def terrain_get_extrude_height(island_max_radius, radius):
     radius_difference = island_max_radius - radius
     return radius_difference * terrain_height_rate + 0.001
 
+def get_path_quad(source, destination, source_island, destination_island, island_max_radius, island_height_offsets,
+                  floating = False):
+
+    stx, sty = source
+    dex, dey = destination
+    source_radius = math.sqrt(stx ** 2 + sty ** 2)
+    destination_radius = math.sqrt(dex ** 2 + dey ** 2)
+
+    source_height = terrain_get_base_height(island_max_radius[source_island], island_height_offsets[source_island]) + \
+                    terrain_get_extrude_height(island_max_radius[source_island], source_radius)
+
+    destination_height = terrain_get_base_height(island_max_radius[destination_island],
+                                                 island_height_offsets[destination_island]) + \
+                         terrain_get_extrude_height(island_max_radius[destination_island], destination_radius)
+
+    dx, dy = dex - stx, dey - sty
+    dis = np.sqrt(dx ** 2 + dy ** 2)
+    fx, fy = dx / dis, dy / dis
+    sx, sy = fy, -fx
+    average_radius = (source_radius + destination_radius) / 2.0
+    thickness = (1 - average_radius) ** 2 / 300.0
+    thickness = max(thickness, 0.0004)
+    tsx, tsy = sx * thickness, sy * thickness
+
+    path_quad = create_quad([(stx - tsx, sty - tsy, source_height),
+                                   (stx + tsx, sty + tsy, source_height),
+                                   (dex + tsx, dey + tsy, destination_height),
+                                   (dex - tsx, dey - tsy, destination_height)])
+    if not floating:
+        return path_quad
+
+    middle_height = (source_height + destination_height)/2 - 0.002
+    tsx*=3.5
+    tsy*=3.5
+    fsx = fx * thickness * 1.5
+    fsy = fy * thickness * 1.5
+    mx, my = (stx+dex)/2, (sty+dey)/2
+    base_quad = create_quad([(mx - tsx - fsx, my - tsy - fsy, middle_height),
+                             (mx + tsx - fsx, my + tsy - fsy, middle_height),
+                             (mx + tsx + fsx, my + tsy + fsy, middle_height),
+                             (mx - tsx + fsx, my - tsy + fsy, middle_height)])
+
+    return path_quad, base_quad
+
 # render the branch starting at the root
 # our path list
 paths = []
+path_features = []
 for angle in range(0, 359, branch_angle_increment):
     hue = angle / 360.0
     saturation = 1.0
@@ -168,7 +217,7 @@ window_texture = building.generate_window_texture()
 
 print ('performing circle union')
 circle_union = unary_union(circles)
-circle_union = circle_union.intersection( Point(0,0).buffer(inner_circle_max))
+circle_union = circle_union.intersection( Point(0,0).buffer(inner_circle_max, resolution=8))
 print ('done')
 
 # let's determine the number of islands, and for each island several properties
@@ -222,13 +271,16 @@ for radius in tqdm(np.arange(inner_circle_max, inner_circle_min, -inner_circle_i
         edges[-1, 1] = 0
         poly = trimesh.path.polygons.edges_to_polygons(edges, np.array(coords))[0]
 
-        base_height = terrain_get_base_height(island_max_radius[island_index], island_height_offsets[island_index])
-        extrude_height = terrain_get_extrude_height(island_max_radius[island_index], radius)
+        if len(coords) > 3:
+            try:
+                base_height = terrain_get_base_height(island_max_radius[island_index], island_height_offsets[island_index])
+                extrude_height = terrain_get_extrude_height(island_max_radius[island_index], radius)
 
-        mesh = trimesh.creation.extrude_polygon(poly, extrude_height)
-        mesh.vertices[:, 2] += base_height
-        mesh.visual.mesh.visual.face_colors = [222, 222, 222, 255]
-        meshes.append(mesh)
+                mesh = trimesh.creation.extrude_polygon(poly, extrude_height)
+                mesh.vertices[:, 2] += base_height
+                meshes.append(mesh)
+            except:
+                print (coords)
 
 
 # generate the building candidates
@@ -266,7 +318,8 @@ for inner_radius in np.arange(inner_circle_max, inner_circle_min, -inner_circle_
 print('\ndone')
 
 # intersect the building candidates with the islands
-building_geoms = []
+building_walls = []
+building_roofs = []
 building_points = MultiPoint(building_points)
 e = 0
 print ('intersecting islands with building candidates')
@@ -284,7 +337,7 @@ for island in tqdm(islands):
 
         for i in point_list:
             x,y = i.coords[0]
-            render_building(x,y, max_radius, height_offset, building_geoms, window_texture)
+            render_building(x,y, max_radius, height_offset, building_walls, building_roofs)
     e+=1
 
 # generate the island bases
@@ -333,55 +386,163 @@ for island in tqdm(islands):
     island_base_mesh = trimesh.Trimesh(vertices=base_coords,faces=faces1)
 
     # clip the bottom of the mesh using a translated bounding box
-    island_base_mesh.visual.mesh.visual.face_colors = [212, 212, 212, 255]
+    #island_base_mesh.visual.mesh.visual.face_colors = [212, 212, 212, 255]
     island_base_meshes.append(island_base_mesh)
     e+=1
 
+print ('intersecting paths with islands')
+print ('generating path union')
+path_union = unary_union(paths)
+
+# here we store the computed heights for later use by the
+# nearest neighbor classifier
+
+path_geoms = []
+path_points = []
+path_point_islands = []
+
+print ('generating path geometries')
+e = 0
+for island in tqdm(islands):
+    path_cut = island.intersection(path_union)
+
+    if isinstance(path_cut, MultiLineString):
+        iterator = path_cut.geoms
+    else:
+        iterator = [path_cut]
+
+    for line_segment in iterator:
+        if len(line_segment.coords)>1:
+            source = line_segment.coords[0]
+            destination = line_segment.coords[1]
+            path_geoms.append(get_path_quad(source, destination, e, e, island_max_radius, island_height_offsets))
+
+            path_points.append(source)
+            path_point_islands.append(e)
+            path_points.append(destination)
+            path_point_islands.append(e)
+    e+=1
+
+print ('\n done')
+
+print ('performing nearest neighbor island lookups')
+
+neigh = KNeighborsClassifier(n_neighbors=3)
+neigh.fit(path_points, path_point_islands)
+
+print ('performing path difference to determine floating areas')
+path_floating = path_union.difference(circle_union)
+path_floating = path_floating.intersection( Point(0,0).buffer(inner_circle_max, resolution=8))
+print (' done')
+
+print ('generating floating path geometries')
+for floating_path in path_floating.geoms:
+    if len(floating_path.coords) > 1:
+        source = floating_path.coords[0]
+        destination = floating_path.coords[1]
+        # TODO vectorize these predictions
+        source_island = int(neigh.predict([source])+0.4)
+        destination_island = int(neigh.predict([destination]) + 0.4)
 
 
-for node in nodes:
-    x, y = node
-    distance = np.sqrt(x ** 2 + y ** 2) + 0.000001
-    radius = influence_radius_multiplier / distance
-    radius = min(radius, influence_radius_max)
-    radius = max(radius, influence_radius_min)
-    ctx.arc(x,y, radius, 0.0, math.pi * 2.0)
-    ctx.set_source_rgb(0.9, 0.4, 0.4)
-    ctx.set_line_width(0.0001)
-    ctx.stroke()
+        path_geom, base_geom = get_path_quad(source, destination, source_island, destination_island, island_max_radius,
+                                        island_height_offsets, floating=True)
+
+        path_geoms.append(path_geom)
+        island_base_meshes.append(base_geom)
+
+print (' done')
 
 
-surface.write_to_png(out_image)
-os.system(out_image)
+
+
+
+
+#for node in nodes:
+#    x, y = node
+#    distance = np.sqrt(x ** 2 + y ** 2) + 0.000001
+#    radius = influence_radius_multiplier / distance
+#    radius = min(radius, influence_radius_max)
+#    radius = max(radius, influence_radius_min)
+#    ctx.arc(x,y, radius, 0.0, math.pi * 2.0)
+#    ctx.set_source_rgb(0.9, 0.4, 0.4)
+#    ctx.set_line_width(0.0001)
+#    ctx.stroke()
+
+
+
+
+#surface.write_to_png(out_image)
+#os.system(out_image)
 terrain_concat = trimesh.util.concatenate(meshes)
 island_base_concat = trimesh.util.concatenate(island_base_meshes)
+building_walls_concat = trimesh.util.concatenate(building_walls)
+building_roofs_concat = trimesh.util.concatenate(building_roofs)
+path_concat = trimesh.util.concatenate(path_geoms)
+#building_concats = []
+#for i in range(0, len(building_geoms), 400):
+#    building_concats.append( trimesh.util.concatenate(building_geoms[i:i+400] ))
+#geometry = [terrain_concat, island_base_concat]
+#geometry.append(building_geoms)
+#scene = trimesh.scene.Scene(geometry=geometry)
 
-building_concats = []
-for i in range(0, len(building_geoms), 400):
-    building_concats.append( trimesh.util.concatenate(building_geoms[i:i+400] ))
 
-geometry = [terrain_concat, island_base_concat]
-geometry.append(building_geoms[0:10])
+scene = trimesh.scene.Scene()
+scene.add_geometry(terrain_concat, node_name = 'terrain')
+scene.add_geometry(island_base_concat, node_name = 'island_base', parent_node_name = 'terrain')
+scene.add_geometry(building_walls_concat, node_name = 'building_walls', parent_node_name = 'terrain')
+scene.add_geometry(building_roofs_concat, node_name = 'building_roofs', parent_node_name = 'terrain')
+scene.add_geometry(path_concat, node_name = 'paths', parent_node_name = 'terrain')
 
-scene = trimesh.scene.Scene(geometry=geometry)
-trimesh.exchange.export.export_scene(scene, 'out/out.glb', file_type='glb')
+uvs_wall = [(0, 0), (0, 1), (1, 0), (1, 1)]*len(building_walls)
+uvs_roof = [(0, 0), (0, 1), (1, 0), (1, 1)]*len(building_roofs)
+uvs_path = [(0, 0), (0, 1), (1, 0), (1, 1)]*len(path_geoms)
+
+material_wall = trimesh.visual.material.PBRMaterial(name='building', baseColorFactor=[255, 100, 100], metallicFactor=0.7,
+                                               roughnessFactor=0.1, emissiveFactor=[1.0,0.6,1.0],
+                                               emissiveTexture=window_texture)
+building_walls_concat.visual = trimesh.visual.TextureVisuals(material=material_wall, uv=uvs_wall)
+
+material_roof = trimesh.visual.material.PBRMaterial(name='roof', baseColorFactor=[180,180,180], metallicFactor=0.9,
+                                                    roughnessFactor=0.35)
+
+building_roofs_concat.visual = trimesh.visual.TextureVisuals(material=material_roof, uv=uvs_roof)
+
+material_path = trimesh.visual.material.PBRMaterial(name='path', baseColorFactor=[80,80,80,150], metallicFactor=0.9,
+                                                    roughnessFactor=0.1, emissiveFactor=[0.1, 0.1, 0.5])
+path_concat.visual = trimesh.visual.TextureVisuals(material=material_path, uv=uvs_path)
+
+
+
+
+
+
+#for e, building in enumerate(building_geoms[:2], 1):
+#    scene.add_geometry(building, node_name = f'building{e}', parent_node_name = 'terrain')
+
+
+#trimesh.exchange.export.export_scene(scene, 'out/out.blp', file_type='blp')
 
 
 #print ('spawning keyshot')
 #subprocess.Popen([r"c:\program files\KeyShot10\bin\keyshot.exe","-script","keyshot.py"])
 #print (' done!')
 
-#pyrender_terrain = pyrender.Mesh.from_trimesh(terrain_concat, smooth=False)
-#pyrender_building = pyrender.Mesh.from_trimesh(building_concats, smooth=False)6
-#pyrender_island_bases = pyrender.Mesh.from_trimesh(island_base_concat, smooth=False)
+pyrender_terrain = pyrender.Mesh.from_trimesh(terrain_concat, smooth=False)
+pyrender_building_walls = pyrender.Mesh.from_trimesh(building_walls_concat, smooth=False)
+pyrender_building_roofs = pyrender.Mesh.from_trimesh(building_roofs_concat, smooth=False)
+pyrender_island_bases = pyrender.Mesh.from_trimesh(island_base_concat, smooth=False)
+pyrender_paths = pyrender.Mesh.from_trimesh(path_concat, smooth=False)
 
-#scene = pyrender.Scene()
-#scene.add(pyrender_terrain)
-#scene.add(pyrender_building)
-#scene.add(pyrender_island_bases)
-#pyrender.Viewer(scene, viewport_size=(1000, 1000),
-#                use_raymond_lighting=True,
-#                shadows=True,
-#                window_title='City Art')
+scene = pyrender.Scene()
+scene.add(pyrender_terrain)
+scene.add(pyrender_building_walls)
+scene.add(pyrender_building_roofs)
+scene.add(pyrender_island_bases)
+scene.add(pyrender_paths)
+pyrender.Viewer(scene, viewport_size=(2400, 1000),
+                use_raymond_lighting=True,
+                shadows=True,
+                window_title='City Art')
 
 
