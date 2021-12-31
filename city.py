@@ -112,8 +112,9 @@ def render_building(x, y, max_radius, height_offset, building_walls, building_ro
     ctx.line_to(x1, y1)
     ctx.stroke()
 
-    base_height = terrain_get_base_height(max_radius, height_offset) + terrain_get_extrude_height(max_radius, dist)
+    base_height = terrain_get_base_height(max_radius, height_offset) + terrain_get_extrude_height(max_radius, dist) - 0.004
     building_height = (1.0 - dist) * building_height_rate + random.random() * 0.02 - 0.01
+    building_height = max(building_height, 0.006)
     top_height = base_height + building_height
 
 
@@ -145,11 +146,11 @@ def get_path_quad(source, destination, source_island, destination_island, island
     destination_radius = math.sqrt(dex ** 2 + dey ** 2)
 
     source_height = terrain_get_base_height(island_max_radius[source_island], island_height_offsets[source_island]) + \
-                    terrain_get_extrude_height(island_max_radius[source_island], source_radius)
+                    terrain_get_extrude_height(island_max_radius[source_island], source_radius) + 0.01
 
     destination_height = terrain_get_base_height(island_max_radius[destination_island],
                                                  island_height_offsets[destination_island]) + \
-                         terrain_get_extrude_height(island_max_radius[destination_island], destination_radius)
+                         terrain_get_extrude_height(island_max_radius[destination_island], destination_radius) + 0.01
 
     dx, dy = dex - stx, dey - sty
     dis = np.sqrt(dx ** 2 + dy ** 2)
@@ -225,68 +226,122 @@ circle_union = circle_union.intersection( Point(0,0).buffer(inner_circle_max, re
 print ('done')
 
 # let's determine the number of islands, and for each island several properties
+print ('generating island heights and min/max radiuses')
 islands = list(circle_union.geoms)
 island_height_offsets = []
+island_min_exact_radius = []
+island_max_exact_radius = []
+center_point = Point(0,0)
 for island in islands:
     island_height_offset = random.random() * 0.1
     island_height_offsets.append(island_height_offset)
+    # determine the min and max radiuses
+    x,y = island.exterior.coords.xy
+    x = np.array(x)
+    y = np.array(y)
+    rad = np.sqrt(x**2 + y**2)
+    if island.contains(center_point):
+        minrad = 0.0
+    else:
+        minrad = np.min(rad)
+    island_min_exact_radius.append(minrad)
+    island_max_exact_radius.append(np.max(rad))
+
+print ('done')
+
 
 # generate the inner circles
 inner_circles = []
 meshes = []
 island_max_radius = np.zeros(len(islands))
 
+splitter = LineString([Point(0, -1), Point(0, 1)])
+
 path_geoms = []
-print ('generating inner ring and path geometries')
-for radius in tqdm(np.arange(inner_circle_max, inner_circle_min, -inner_circle_increment)):
-
-    point = Point(0,0)
-    circle = point.buffer(radius, resolution = 8)
-    circle_inner = point.buffer(radius - inner_circle_increment, resolution = 8)
-    ring = circle - circle_inner
-
-    inner_circle = circle_union.intersection(ring)
-    ring_path = circle_union.intersection(ring_path)
-    inner_circles.append(inner_circle)
-
-    lines = []
-    boundary = inner_circle.boundary
-    if boundary.type == 'MultiLineString':
-        for line in boundary:
-            lines.append(line)
+path_ring_geoms = []
+point = Point(0, 0)
+for path_iter in range(0,2):
+    if path_iter == 0:
+        print ('generating inner ring geometries')
     else:
-        lines.append(boundary)
+        print ('generating path ring geometries')
 
-    for line in lines:
-        coords = line.coords
-        for i in range(len(coords) - 1):
-            ctx.move_to(coords[i][0], coords[i][1])
-            ctx.line_to(coords[i + 1][0], coords[i + 1][1])
-            ctx.set_line_width(0.001)
-            ctx.set_source_rgb(radius, radius, 1.0)
-            ctx.stroke()
+    for radius in tqdm(np.arange(inner_circle_max, inner_circle_min, -inner_circle_increment)):
+        circle = point.buffer(radius, resolution = 8)
+        if path_iter == 0:
+            circle_inner = point.buffer(radius - inner_circle_increment, resolution = 8)
+        else:
+            circle_inner = point.buffer(radius - inner_circle_increment/8, resolution = 8)
+        ring = circle - circle_inner
 
-        for island_index in range(len(islands)):
-            if islands[island_index].intersects(line):
-                break
+        inner_circle = circle_union.intersection(ring)
+        if path_iter == 0:
+            inner_circles.append(inner_circle)
 
-        if island_max_radius[island_index] < radius:
-            island_max_radius[island_index] = radius
-        # create the ring geometries
-        edges = np.array([np.arange(0, len(coords)-1), np.arange(1, len(coords))]).T
-        edges[-1, 1] = 0
-        poly = trimesh.path.polygons.edges_to_polygons(edges, np.array(coords))[0]
+        if not inner_circle.is_empty:
 
-        if len(coords) > 3:
-            try:
-                base_height = terrain_get_base_height(island_max_radius[island_index], island_height_offsets[island_index])
-                extrude_height = terrain_get_extrude_height(island_max_radius[island_index], radius)
 
-                mesh = trimesh.creation.extrude_polygon(poly, extrude_height)
-                mesh.vertices[:, 2] += base_height
-                meshes.append(mesh)
-            except:
-                print (coords)
+            lines = []
+            if path_iter == 1:
+                splitted_ring = split(inner_circle, splitter)
+                for geom in splitted_ring:
+                    boundary = geom.boundary
+                    if boundary.type == 'MultiLineString':
+                        for line in boundary:
+                            lines.append(line)
+                    else:
+                        lines.append(boundary)
+            else:
+                boundary = inner_circle.boundary
+
+                if boundary.type == 'MultiLineString':
+                    for line in boundary:
+                        lines.append(line)
+                else:
+                    lines.append(boundary)
+
+            for line in lines:
+                coords = line.coords
+                for i in range(len(coords) - 1):
+                    ctx.move_to(coords[i][0], coords[i][1])
+                    ctx.line_to(coords[i + 1][0], coords[i + 1][1])
+                    ctx.set_line_width(0.001)
+                    ctx.set_source_rgb(radius, radius, 1.0)
+                    ctx.stroke()
+
+                # intersect the geometry with the relevant islands to get the correct height
+                # this could be more efficient
+                # use the precomputed min and max radiuses to speed this up a bit
+                for island_index in range(len(islands)):
+                    if radius > island_min_exact_radius[island_index] and \
+                        radius < island_max_exact_radius[island_index] + inner_circle_increment:
+                        if islands[island_index].intersects(line):
+                            break
+
+                if island_max_radius[island_index] < radius:
+                    island_max_radius[island_index] = radius
+                # create the ring geometries
+                edges = np.array([np.arange(0, len(coords)-1), np.arange(1, len(coords))]).T
+                edges[-1, 1] = 0
+                poly = trimesh.path.polygons.edges_to_polygons(edges, np.array(coords))[0]
+
+                if len(coords) > 3:
+                    try:
+                        base_height = terrain_get_base_height(island_max_radius[island_index],
+                                                              island_height_offsets[island_index])
+                        extrude_height = terrain_get_extrude_height(island_max_radius[island_index], radius)
+                        if path_iter == 0:
+                            mesh = trimesh.creation.extrude_polygon(poly, extrude_height)
+                            mesh.vertices[:, 2] += base_height
+                            meshes.append(mesh)
+                        else:
+                            base_height+=extrude_height
+                            mesh = trimesh.creation.extrude_polygon(poly, 0.0005)
+                            mesh.vertices[:, 2] += base_height
+                            path_ring_geoms.append(mesh)
+
+                    except:
+                        print (coords)
 
 
 # generate the building candidates
@@ -446,7 +501,7 @@ for floating_path in path_floating.geoms:
     if len(floating_path.coords) > 1:
         source = floating_path.coords[0]
         destination = floating_path.coords[1]
-        # TODO vectorize these predictions
+
         source_island = int(neigh.predict([source])+0.4)
         destination_island = int(neigh.predict([destination]) + 0.4)
 
@@ -485,6 +540,7 @@ island_base_concat = trimesh.util.concatenate(island_base_meshes)
 building_walls_concat = trimesh.util.concatenate(building_walls)
 building_roofs_concat = trimesh.util.concatenate(building_roofs)
 path_concat = trimesh.util.concatenate(path_geoms)
+path_ring_concat = trimesh.util.concatenate(path_ring_geoms)
 #building_concats = []
 #for i in range(0, len(building_geoms), 400):
 #    building_concats.append( trimesh.util.concatenate(building_geoms[i:i+400] ))
@@ -499,6 +555,7 @@ scene.add_geometry(island_base_concat, node_name = 'island_base', parent_node_na
 scene.add_geometry(building_walls_concat, node_name = 'building_walls', parent_node_name = 'terrain')
 scene.add_geometry(building_roofs_concat, node_name = 'building_roofs', parent_node_name = 'terrain')
 scene.add_geometry(path_concat, node_name = 'paths', parent_node_name = 'terrain')
+scene.add_geometry(path_ring_concat, node_name = 'path_rings', parent_node_name = 'terrain')
 
 uvs_wall = [(0, 0), (0, 1), (1, 0), (1, 1)]*len(building_walls)
 uvs_roof = [(0, 0), (0, 1), (1, 0), (1, 1)]*len(building_roofs)
@@ -518,6 +575,7 @@ material_path = trimesh.visual.material.PBRMaterial(name='path', baseColorFactor
                                                     roughnessFactor=0.1, emissiveFactor=[0.1, 0.1, 0.5])
 path_concat.visual = trimesh.visual.TextureVisuals(material=material_path, uv=uvs_path)
 
+path_ring_concat.visual.mesh.visual.face_colors = [80,129,255,200]
 
 
 
@@ -539,6 +597,7 @@ pyrender_building_walls = pyrender.Mesh.from_trimesh(building_walls_concat, smoo
 pyrender_building_roofs = pyrender.Mesh.from_trimesh(building_roofs_concat, smooth=False)
 pyrender_island_bases = pyrender.Mesh.from_trimesh(island_base_concat, smooth=False)
 pyrender_paths = pyrender.Mesh.from_trimesh(path_concat, smooth=False)
+pyrender_path_rings = pyrender.Mesh.from_trimesh(path_ring_concat, smooth=False)
 
 scene = pyrender.Scene()
 scene.add(pyrender_terrain)
@@ -546,6 +605,7 @@ scene.add(pyrender_building_walls)
 scene.add(pyrender_building_roofs)
 scene.add(pyrender_island_bases)
 scene.add(pyrender_paths)
+scene.add(pyrender_path_rings)
 pyrender.Viewer(scene, viewport_size=(2400, 1000),
                 use_raymond_lighting=True,
                 shadows=True,
