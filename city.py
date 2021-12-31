@@ -173,12 +173,16 @@ def get_path_quad(source, destination, source_island, destination_island, island
     fsx = fx * thickness * 1.5
     fsy = fy * thickness * 1.5
     mx, my = (stx+dex)/2, (sty+dey)/2
-    base_quad = create_quad([(mx - tsx - fsx, my - tsy - fsy, middle_height),
-                             (mx + tsx - fsx, my + tsy - fsy, middle_height),
-                             (mx + tsx + fsx, my + tsy + fsy, middle_height),
-                             (mx - tsx + fsx, my - tsy + fsy, middle_height)])
+    vertices = [(mx - tsx - fsx, my - tsy - fsy),
+                             (mx + tsx - fsx, my + tsy - fsy),
+                             (mx + tsx + fsx, my + tsy + fsy),
+                             (mx - tsx + fsx, my - tsy + fsy)]
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+    poly = trimesh.path.polygons.edges_to_polygons(edges, np.array(vertices))[0]
+    base_extruded = trimesh.creation.extrude_polygon(poly, 0.002)
+    base_extruded.vertices[:, 2] += middle_height - 0.002
 
-    return path_quad, base_quad
+    return path_quad, base_extruded
 
 # render the branch starting at the root
 # our path list
@@ -232,7 +236,8 @@ inner_circles = []
 meshes = []
 island_max_radius = np.zeros(len(islands))
 
-print ('generating inner ring geometries')
+path_geoms = []
+print ('generating inner ring and path geometries')
 for radius in tqdm(np.arange(inner_circle_max, inner_circle_min, -inner_circle_increment)):
 
     point = Point(0,0)
@@ -241,6 +246,7 @@ for radius in tqdm(np.arange(inner_circle_max, inner_circle_min, -inner_circle_i
     ring = circle - circle_inner
 
     inner_circle = circle_union.intersection(ring)
+    ring_path = circle_union.intersection(ring_path)
     inner_circles.append(inner_circle)
 
     lines = []
@@ -310,8 +316,8 @@ for inner_radius in np.arange(inner_circle_max, inner_circle_min, -inner_circle_
             ctx.stroke()
 
         elif random.random() > inner_radius * 0.6:
-            x = np.cos(angle) * (inner_radius + 0.0125)
-            y = np.sin(angle) * (inner_radius + 0.0125)
+            x = np.cos(angle) * (inner_radius + 0.0065)
+            y = np.sin(angle) * (inner_radius + 0.0065)
             point = Point(x, y)
             building_points.append(point)
 
@@ -397,7 +403,7 @@ path_union = unary_union(paths)
 # here we store the computed heights for later use by the
 # nearest neighbor classifier
 
-path_geoms = []
+
 path_points = []
 path_point_islands = []
 
@@ -521,7 +527,7 @@ path_concat.visual = trimesh.visual.TextureVisuals(material=material_path, uv=uv
 #    scene.add_geometry(building, node_name = f'building{e}', parent_node_name = 'terrain')
 
 
-#trimesh.exchange.export.export_scene(scene, 'out/out.blp', file_type='blp')
+trimesh.exchange.export.export_scene(scene, 'out/out.glb', file_type='glb')
 
 
 #print ('spawning keyshot')
